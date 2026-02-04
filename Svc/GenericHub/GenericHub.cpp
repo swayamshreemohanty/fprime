@@ -14,12 +14,32 @@
 #include <Svc/GenericHub/GenericHub.hpp>
 #include "Fw/Logger/Logger.hpp"
 #include "Fw/Types/Assert.hpp"
-#include <cstdio>
+#include <cstring>
+
+// Platform-specific byte order helpers
+#ifdef __ZEPHYR__
+    #include <zephyr/sys/byteorder.h>
+    #define cpu_to_le16(x) sys_cpu_to_le16(x)
+    #define le16_to_cpu(x) sys_le16_to_cpu(x)
+#else
+    #include <endian.h>
+    #define cpu_to_le16(x) htole16(x)
+    #define le16_to_cpu(x) le16toh(x)
+#endif
 
 // Required port serialization or the hub cannot work
 static_assert(FW_PORT_SERIALIZATION, "FW_PORT_SERIALIZATION must be enabled to use GenericHub");
 
 namespace Svc {
+
+// Wire header: tightly packed to avoid padding
+#pragma pack(push, 1)
+struct HubHeader {
+    U8 type;
+    U8 port;
+    U16 size;
+};
+#pragma pack(pop)
 
 // ----------------------------------------------------------------------
 // Construction, initialization, and destruction
@@ -34,30 +54,27 @@ void GenericHub::send_data(const HubType type, const FwIndexType port, const U8*
         Fw::Logger::log("GenericHub: send_data nullptr payload");
         return;
     }
-    Fw::SerializeStatus status;
-    // Buffer to send and a buffer used to write to it
-    Fw::Buffer outgoing = allocate_out(0, static_cast<U32>(size + sizeof(U32) + sizeof(U32) + sizeof(FwBuffSizeType)));
-    auto serialize = outgoing.getSerializer();
-    // Write data to our buffer
-    status = serialize.serializeFrom(static_cast<U32>(type));
-    if (status != Fw::FW_SERIALIZE_OK) {
-        Fw::Logger::log("GenericHub: serialize type failed %d", status);
-        deallocate_out(0, outgoing);
+    if (size == 0) {
+        Fw::Logger::log("GenericHub: send_data zero-length payload");
         return;
     }
-    status = serialize.serializeFrom(static_cast<U32>(port));
-    if (status != Fw::FW_SERIALIZE_OK) {
-        Fw::Logger::log("GenericHub: serialize port failed %d", status);
-        deallocate_out(0, outgoing);
-        return;
-    }
-    status = serialize.serializeFrom(data, size);
-    if (status != Fw::FW_SERIALIZE_OK) {
-        Fw::Logger::log("GenericHub: serialize payload failed %d", status);
-        deallocate_out(0, outgoing);
-        return;
-    }
-    outgoing.setSize(static_cast<U32>(serialize.getSize()));
+    
+    const FwSizeType totalSize = static_cast<FwSizeType>(sizeof(HubHeader) + size);
+    Fw::Buffer outgoing = allocate_out(0, static_cast<U32>(totalSize));
+
+    // Build packed header with little-endian fields
+    HubHeader header = {};
+    header.type = static_cast<U8>(type);
+    header.port = static_cast<U8>(port);
+    header.size = cpu_to_le16(static_cast<U16>(size));
+
+    // Copy header + payload
+    U8* outData = outgoing.getData();
+    memcpy(outData, &header, sizeof(header));
+    memcpy(outData + sizeof(header), data, size);
+
+    outgoing.setSize(static_cast<U32>(totalSize));
+    
     toBufferDriver_out(0, outgoing);
 }
 
@@ -76,99 +93,43 @@ void GenericHub::bufferOutReturn_handler(FwIndexType portNum, Fw::Buffer& fwBuff
 }
 
 void GenericHub::fromBufferDriver_handler(const FwIndexType portNum, Fw::Buffer& fwBuffer) {
-    HubType type = HUB_TYPE_MAX;
-    U32 type_in = 0;
-    U32 port = 0;
-    FwBuffSizeType size = 0;
-    Fw::SerializeStatus status = Fw::FW_SERIALIZE_OK;
-    const U32 headerSize = sizeof(U32) + sizeof(U32) + sizeof(FwBuffSizeType);
+    static uint32_t rxFrameCount = 0;
 
-    // Drop obviously invalid packets before touching the buffer contents
-    if (fwBuffer.getSize() < headerSize) {
-        printf("[GenericHub] Dropped: size %u < header %u\n", fwBuffer.getSize(), headerSize);
-        fflush(stdout);
+    if (fwBuffer.getSize() < sizeof(HubHeader)) {
+        rxFrameCount++;
         fromBufferDriverReturn_out(0, fwBuffer);
         return;
     }
 
-    printf("[GenericHub] RX from STM32: size=%u bytes\n", fwBuffer.getSize());
-    
-    // Hex dump first 20 bytes for debugging
-    U8* data = fwBuffer.getData();
-    printf("[GenericHub]   Hex: ");
-    for (U32 i = 0; i < fwBuffer.getSize() && i < 20; i++) {
-        printf("%02X ", data[i]);
-    }
-    printf("\n");
-    fflush(stdout);
+    // Parse packed header with little-endian fields
+    HubHeader header = {};
+    memcpy(&header, fwBuffer.getData(), sizeof(HubHeader));
 
-    // Representation of incoming data prepped for serialization
-    auto incoming = fwBuffer.getDeserializer();
-    status = incoming.deserializeTo(type_in);
-    if (status != Fw::FW_SERIALIZE_OK) {
-        printf("[GenericHub] ERROR: deserialize type failed %d\n", status);
-        fflush(stdout);
-        fromBufferDriverReturn_out(0, fwBuffer);
-        return;
-    }
-    printf("[GenericHub]   type_in=%u ", type_in);
-    fflush(stdout);
-    
-    type = static_cast<HubType>(type_in);
+    const HubType type = static_cast<HubType>(header.type);
     if (type >= HUB_TYPE_MAX) {
-        printf("[GenericHub] ERROR: invalid type %u >= max %u\n", type_in, HUB_TYPE_MAX);
-        fflush(stdout);
+        rxFrameCount++;
         fromBufferDriverReturn_out(0, fwBuffer);
         return;
     }
-    status = incoming.deserializeTo(port);
-    if (status != Fw::FW_SERIALIZE_OK) {
-        printf("[GenericHub] ERROR: deserialize port failed %d\n", status);
-        fflush(stdout);
-        fromBufferDriverReturn_out(0, fwBuffer);
-        return;
-    }
-    printf("port=%u ", port);
-    fflush(stdout);
+
+    const U32 port = header.port;
+    const FwBuffSizeType size = le16_to_cpu(header.size);
     
-    status = incoming.deserializeTo(size);
-    if (status != Fw::FW_SERIALIZE_OK) {
-        printf("[GenericHub] ERROR: deserialize size failed %d\n", status);
-        fflush(stdout);
+    // Validate size matches buffer
+    U8* rawData = fwBuffer.getData() + sizeof(HubHeader);
+    const U32 rawSize = static_cast<U32>(fwBuffer.getSize() - sizeof(HubHeader));
+    Fw::SerializeStatus status = Fw::FW_SERIALIZE_OK;
+
+    if (rawSize != static_cast<U32>(size)) {
+        rxFrameCount++;
         fromBufferDriverReturn_out(0, fwBuffer);
         return;
     }
-    printf("size=%u\n", size);
-    fflush(stdout);
-
-    // Ensure payload size matches buffer size to avoid overruns on corrupt packets
-    const U32 requiredSize = headerSize + static_cast<U32>(size);
-    if (fwBuffer.getSize() < requiredSize) {
-        printf("[GenericHub] ERROR: size mismatch buffer=%u < required=%u\n", fwBuffer.getSize(), requiredSize);
-        fflush(stdout);
-        fromBufferDriverReturn_out(0, fwBuffer);
-        return;
-    }
-    if (size == 0) {
-        printf("[GenericHub] ERROR: zero payload size\n");
-        fflush(stdout);
-        fromBufferDriverReturn_out(0, fwBuffer);
-        return;
-    }
-
-    // Log packet type
-    const char* typeNames[] = {"PORT", "BUFFER", "EVENT", "CHANNEL", "MAX"};
-    printf("[GenericHub] Packet: type=%s(%u), port=%u, size=%u\n", 
-           type < HUB_TYPE_MAX ? typeNames[type] : "UNKNOWN", type, port, size);
-    fflush(stdout);
-
-    // invokeSerial deserializes arguments before calling a normal invoke, this will return ownership immediately
-    U8* rawData = fwBuffer.getData() + headerSize;
-    U32 rawSize = static_cast<U32>(size);  // use declared payload size
+    
+    rxFrameCount++;
     if (type == HUB_TYPE_PORT) {
         if (port >= this->getNum_serialOut_OutputPorts()) {
-            printf("[GenericHub] ERROR: invalid serial port %u (max %u)\n", port, this->getNum_serialOut_OutputPorts());
-            fflush(stdout);
+            Fw::Logger::log("[GenericHub] ERROR: invalid serial port %u (max %u)", port, this->getNum_serialOut_OutputPorts());
             fromBufferDriverReturn_out(0, fwBuffer);
             return;
         }
@@ -176,106 +137,78 @@ void GenericHub::fromBufferDriver_handler(const FwIndexType portNum, Fw::Buffer&
         Fw::ExternalSerializeBuffer wrapper(rawData, rawSize);
         status = wrapper.setBuffLen(rawSize);
         if (status != Fw::FW_SERIALIZE_OK) {
-            printf("[GenericHub] ERROR: wrapper.setBuffLen failed %d\n", status);
-            fflush(stdout);
+            Fw::Logger::log("[GenericHub] ERROR: wrapper.setBuffLen failed %d", status);
             fromBufferDriverReturn_out(0, fwBuffer);
             return;
         }
-        printf("[GenericHub] → Forwarding PORT to serialOut[%u]\n", port);
-        fflush(stdout);
+        Fw::Logger::log("[GenericHub] → Forwarding PORT to serialOut[%u]", port);
         serialOut_out(static_cast<FwIndexType>(port), wrapper);
         // Deallocate the existing buffer
         fromBufferDriverReturn_out(0, fwBuffer);
     } else if (type == HUB_TYPE_BUFFER) {
         if (port >= this->getNum_bufferOut_OutputPorts()) {
-            printf("[GenericHub] ERROR: invalid buffer port %u (max %u)\n", port, this->getNum_bufferOut_OutputPorts());
-            fflush(stdout);
+            Fw::Logger::log("[GenericHub] ERROR: invalid buffer port %u (max %u)", port, this->getNum_bufferOut_OutputPorts());
             fromBufferDriverReturn_out(0, fwBuffer);
             return;
         }
-        printf("[GenericHub] → Forwarding BUFFER to bufferOut[%u]\n", port);
-        fflush(stdout);
+        Fw::Logger::log("[GenericHub] → Forwarding BUFFER to bufferOut[%u]", port);
         // Fw::Buffers can reuse the existing data buffer as the storage type!  No deallocation done.
         fwBuffer.set(rawData, rawSize, fwBuffer.getContext());
         bufferOut_out(static_cast<FwIndexType>(port), fwBuffer);
     } else if (type == HUB_TYPE_EVENT) {
         if (port >= this->getNum_eventOut_OutputPorts()) {
-            printf("[GenericHub] ERROR: invalid event port %u (max %u)\n", port, this->getNum_eventOut_OutputPorts());
-            fflush(stdout);
+            Fw::Logger::log("[GenericHub] ERROR: invalid event port %u (max %u)", port, this->getNum_eventOut_OutputPorts());
             fromBufferDriverReturn_out(0, fwBuffer);
             return;
         }
-        printf("[GenericHub] Processing EVENT packet, port=%u\n", port);
-        fflush(stdout);
+        Fw::Logger::log("[GenericHub] Processing EVENT packet, port=%u", port);
         FwEventIdType id;
         Fw::Time timeTag;
         Fw::LogSeverity severity;
         Fw::LogBuffer args;
 
-        // Deserialize tokens for events
-        status = incoming.deserializeTo(id);
-        if (status != Fw::FW_SERIALIZE_OK) {
-            Fw::Logger::log("GenericHub: event id deserialize failed %d", status);
-            fromBufferDriverReturn_out(0, fwBuffer);
-            return;
-        }
-        status = incoming.deserializeTo(timeTag);
-        if (status != Fw::FW_SERIALIZE_OK) {
-            Fw::Logger::log("GenericHub: event time deserialize failed %d", status);
-            fromBufferDriverReturn_out(0, fwBuffer);
-            return;
-        }
-        status = incoming.deserializeTo(severity);
-        if (status != Fw::FW_SERIALIZE_OK) {
-            Fw::Logger::log("GenericHub: event severity deserialize failed %d", status);
-            fromBufferDriverReturn_out(0, fwBuffer);
-            return;
-        }
-        status = incoming.deserializeTo(args);
-        if (status != Fw::FW_SERIALIZE_OK) {
-            Fw::Logger::log("GenericHub: event args deserialize failed %d", status);
-            fromBufferDriverReturn_out(0, fwBuffer);
-            return;
-        }
+        // Deserialize tokens for events from the payload
+        Fw::ExternalSerializeBuffer deserializer(rawData, rawSize);
+        Fw::SerializeStatus status = deserializer.setBuffLen(rawSize);
+        FW_ASSERT(status == Fw::FW_SERIALIZE_OK, static_cast<FwAssertArgType>(status));
+        
+        status = deserializer.deserializeTo(id);
+        FW_ASSERT(status == Fw::FW_SERIALIZE_OK, static_cast<FwAssertArgType>(status));
+        status = deserializer.deserializeTo(timeTag);
+        FW_ASSERT(status == Fw::FW_SERIALIZE_OK, static_cast<FwAssertArgType>(status));
+        status = deserializer.deserializeTo(severity);
+        FW_ASSERT(status == Fw::FW_SERIALIZE_OK, static_cast<FwAssertArgType>(status));
+        status = deserializer.deserializeTo(args);
+        FW_ASSERT(status == Fw::FW_SERIALIZE_OK, static_cast<FwAssertArgType>(status));
 
         // Send it!
-        Fw::Logger::log("[GenericHub] Forwarding EVENT id=0x%x to eventOut[%u], severity=%d\n", id, port, severity.e);
         this->eventOut_out(static_cast<FwIndexType>(port), id, timeTag, severity, args);
 
         // Deallocate the existing buffer
         fromBufferDriverReturn_out(0, fwBuffer);
     } else if (type == HUB_TYPE_CHANNEL) {
         if (port >= this->getNum_tlmOut_OutputPorts()) {
-            Fw::Logger::log("GenericHub: invalid tlm port %u (max %u)", port, this->getNum_tlmOut_OutputPorts());
+            Fw::Logger::log("[GenericHub] ERROR: invalid tlm port %u (max %u)", port, this->getNum_tlmOut_OutputPorts());
             fromBufferDriverReturn_out(0, fwBuffer);
             return;
-        }        printf("[GenericHub] Processing CHANNEL (telemetry) packet, port=%u\n", port);
-        fflush(stdout);        FwChanIdType id;
+        }
+        FwChanIdType id;
         Fw::Time timeTag;
         Fw::TlmBuffer val;
 
-        // Deserialize tokens for channels
-        status = incoming.deserializeTo(id);
-        if (status != Fw::FW_SERIALIZE_OK) {
-            Fw::Logger::log("GenericHub: channel id deserialize failed %d", status);
-            fromBufferDriverReturn_out(0, fwBuffer);
-            return;
-        }
-        status = incoming.deserializeTo(timeTag);
-        if (status != Fw::FW_SERIALIZE_OK) {
-            Fw::Logger::log("GenericHub: channel time deserialize failed %d", status);
-            fromBufferDriverReturn_out(0, fwBuffer);
-            return;
-        }
-        status = incoming.deserializeTo(val);
-        if (status != Fw::FW_SERIALIZE_OK) {
-            Fw::Logger::log("GenericHub: channel val deserialize failed %d", status);
-            fromBufferDriverReturn_out(0, fwBuffer);
-            return;
-        }
+        // Deserialize tokens for channels from the payload
+        Fw::ExternalSerializeBuffer deserializer(rawData, rawSize);
+        Fw::SerializeStatus status = deserializer.setBuffLen(rawSize);
+        FW_ASSERT(status == Fw::FW_SERIALIZE_OK, static_cast<FwAssertArgType>(status));
+        
+        status = deserializer.deserializeTo(id);
+        FW_ASSERT(status == Fw::FW_SERIALIZE_OK, static_cast<FwAssertArgType>(status));
+        status = deserializer.deserializeTo(timeTag);
+        FW_ASSERT(status == Fw::FW_SERIALIZE_OK, static_cast<FwAssertArgType>(status));
+        status = deserializer.deserializeTo(val);
+        FW_ASSERT(status == Fw::FW_SERIALIZE_OK, static_cast<FwAssertArgType>(status));
 
         // Send it!
-        Fw::Logger::log("[GenericHub] Forwarding TELEMETRY id=0x%x to tlmOut[%u]\n", id, port);
         this->tlmOut_out(static_cast<FwIndexType>(port), id, timeTag, val);
 
         // Return the received buffer
