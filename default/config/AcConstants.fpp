@@ -31,7 +31,7 @@ constant StaticMemoryAllocations = 4
 constant HealthPingPorts = 25
 
 @ Used for broadcasting completed file downlinks
-constant FileDownCompletePorts = 1
+constant FileDownCompletePorts = 3
 
 @ Used for number of Fw::Com type ports supported by Svc::ComQueue
 constant ComQueueComPorts = 2
