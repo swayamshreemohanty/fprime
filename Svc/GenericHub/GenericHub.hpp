@@ -103,6 +103,10 @@ class GenericHub final : public GenericHubComponentBase {
 
     // Helpers and members
     void send_data(const HubType type, const FwIndexType port, const U8* data, const FwSizeType size);
+
+    // Deframing accumulator
+    U8 m_accumulator[10240];  // 10 KB buffer
+    U32 m_accumulatorSize = 0;
 };
 
 }  // end namespace Svc
